@@ -310,11 +310,12 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 			btx *btree.ReadTx
 			s   *collSchema
 		)
-		if btx, s, lookupTx, err = q.lookupBtreeTx(ctx, inner); err != nil {
+		var lk ReadTx
+		if btx, s, lookupTx, lk, err = q.lookupBtreeTx(ctx, inner); err != nil {
 			_ = inner.Close()
 			return nil, err
 		}
-		env.Lookup = q.c.lookupFunc(btx, s)
+		env.Lookup = q.c.lookupFunc(btx, s, lk)
 	}
 
 	limits := q.limits.WithDefaults()
@@ -352,28 +353,41 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 // prefix is provably empty the iterator has no tx at all, yet a $count
 // downstream can still synthesize rows whose fields feed $lookup — then a
 // dedicated read tx is opened, returned as held for aggIterator to release on
-// Close.
-func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, s *collSchema, held ReadTx, err error) {
+// Close. lk is the transaction a lookup locks for its turn, nil when nobody
+// else can reach it (planIterator.lk).
+func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, s *collSchema, held, lk ReadTx, err error) {
 	if pi, ok := inner.(*planIterator); ok {
-		return pi.tx.btreeReadTx(), pi.s, nil, nil
+		return pi.tx.btreeReadTx(), pi.s, nil, pi.lk, nil
 	}
 	tx, err := q.c.db.getReadTx(ctx)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
+	}
+	tx, lk = detachLock(tx)
+	if lk != nil {
+		defer lk.unlock()
 	}
 	if s, err = q.c.resolve(tx.btreeReadTx()); err != nil {
 		_ = tx.Commit()
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return tx.btreeReadTx(), s, tx, nil
+	return tx.btreeReadTx(), s, tx, lk, nil
 }
 
 // lookupFunc serves $lookup point reads against btx, s being the version
 // resolved for it. A missing key is a non-match, not an error. The document
 // is parsed owned into buf (stage-owned scratch): valid until the stage
-// reuses the same buf.
-func (c *collection) lookupFunc(btx *btree.ReadTx, s *collSchema) aggregate.LookupFunc {
+// reuses the same buf. A read takes its turn on lk when the transaction is
+// shared (see lookupBtreeTx).
+func (c *collection) lookupFunc(btx *btree.ReadTx, s *collSchema, lk ReadTx) aggregate.LookupFunc {
 	return func(key []byte, buf *syncpool.DocBuffer) (*anyenc.Value, error) {
+		if lk != nil {
+			lk.lock()
+			defer lk.unlock()
+			if lk.Done() {
+				return nil, ErrTxIsUsed
+			}
+		}
 		var err error
 		buf.DocBuf, err = btx.AppendValue(s.ns, key, buf.DocBuf[:0])
 		if err != nil {

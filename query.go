@@ -443,6 +443,12 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		qb.Close()
 		return
 	}
+	// The iterator keeps tx beyond this call: the turn ends with the call,
+	// and the iterator's methods take theirs.
+	tx, lk := detachLock(tx)
+	if lk != nil {
+		defer lk.unlock()
+	}
 
 	// Resolved inside the tx scope, for its snapshot (collection.resolve).
 	btx := tx.btreeReadTx()
@@ -466,6 +472,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	return &planIterator{
 		plan: plan,
 		tx:   tx,
+		lk:   lk,
 		s:    s,
 		buf:  buf,
 		qb:   qb,
@@ -579,9 +586,13 @@ func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.Writ
 		}
 	}()
 
-	tx, err := q.c.db.WriteTx(ctx)
+	tx, locked, err := q.c.db.enterWriteTx(ctx)
 	if err != nil {
 		return
+	}
+	// Registered first: released after the commit or rollback below.
+	if locked != nil {
+		defer locked.unlock()
 	}
 	defer func() {
 		// A panic (a user modifier's or filter's bug) leaves err == nil, so keying

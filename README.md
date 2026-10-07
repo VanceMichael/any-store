@@ -97,6 +97,8 @@ if err := tx.Commit(); err != nil { // or tx.Rollback()
 
 Any operation run with `tx.Context()` joins the transaction. Read transactions (`db.ReadTx`) pin a consistent snapshot; writers never block readers. One write transaction is active at a time — across all processes.
 
+A transaction may be used from several goroutines: the calls made on it — operations run with its context, its savepoints, the methods of its iterators, `Commit` and `Rollback` — run one at a time, in the order they get their turn, like the calls on one SQLite connection in serialized threading mode. Serialization is all it adds: a sequence of calls that is undefined from one goroutine (writing to a collection while an iterator on it is open) stays undefined from several. A callback (a `query.Modifier`) must not use the transaction it runs in.
+
 ## Indexes
 
 ```go

@@ -47,6 +47,10 @@ type Iterator interface {
 // planIterator wraps a qplanner.Plan to implement the public Iterator interface.
 type planIterator struct {
 	tx ReadTx
+	// lk is tx when other callers can reach it — the transaction the
+	// context carries — for the turn each method takes on it (see
+	// commonTx.opMu); nil for the iterator's own read transaction.
+	lk ReadTx
 	// s is the schema version the plan was compiled against, resolved for tx.
 	s          *collSchema
 	err        error
@@ -64,6 +68,14 @@ type planIterator struct {
 func (pi *planIterator) Next() bool {
 	if pi.err != nil || pi.closed {
 		return false
+	}
+	if pi.lk != nil {
+		pi.lk.lock()
+		defer pi.lk.unlock()
+		if pi.lk.Done() {
+			pi.err = ErrTxIsUsed
+			return false
+		}
 	}
 	for {
 		pi.plan.DocParsed = nil
@@ -132,6 +144,13 @@ func (pi *planIterator) Doc() (Doc, error) {
 		if perf {
 			pipePerf.docFallbacks.Add(1)
 		}
+		if pi.lk != nil {
+			pi.lk.lock()
+			defer pi.lk.unlock()
+			if pi.lk.Done() {
+				return nil, ErrTxIsUsed
+			}
+		}
 		if pi.dataCursor == nil {
 			pi.dataCursor = pi.data.NewCursor()
 		}
@@ -189,11 +208,19 @@ func (pi *planIterator) Close() (err error) {
 		return ErrIterClosed
 	}
 	pi.closed = true
-	if pi.dataCursor != nil {
-		pi.dataCursor.Close()
+	if pi.lk != nil {
+		pi.lk.lock()
+		defer pi.lk.unlock()
 	}
-	if pi.plan != nil {
-		pi.plan.Close()
+	// The cursors' pages are the transaction's: ended by another call, it
+	// took them, and the cursors are left alone.
+	if pi.lk == nil || !pi.lk.Done() {
+		if pi.dataCursor != nil {
+			pi.dataCursor.Close()
+		}
+		if pi.plan != nil {
+			pi.plan.Close()
+		}
 	}
 	if pi.tx != nil {
 		err = errors.Join(err, pi.tx.Commit())
