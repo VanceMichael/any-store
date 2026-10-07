@@ -21,6 +21,9 @@ import (
 // collect the ids during iteration and mutate after Close — any-store's own
 // Query.Update/Delete do exactly that internally — or use those verbs
 // directly.
+// An Iterator belongs to one goroutine at a time. Opened with the context
+// of a transaction, its methods take their turn on the transaction, and
+// once the transaction has ended Next and Doc fail with ErrTxIsUsed.
 type Iterator interface {
 	// Next advances the iterator to the next document.
 	Next() bool
@@ -49,8 +52,14 @@ type planIterator struct {
 	tx ReadTx
 	// lk is tx when other callers can reach it — the transaction the
 	// context carries — for the turn each method takes on it (see
-	// commonTx.opMu); nil for the iterator's own read transaction.
+	// commonTx); nil for the iterator's own read transaction. The
+	// transaction knows the iterator (iterOpened) until Close, and trips it
+	// as it ends.
 	lk ReadTx
+	// tripped: the transaction ended and took the cursors' pages with it
+	// (trip); the methods report ErrTxIsUsed and Close leaves the cursors
+	// alone.
+	tripped bool
 	// s is the schema version the plan was compiled against, resolved for tx.
 	s          *collSchema
 	err        error
@@ -72,7 +81,7 @@ func (pi *planIterator) Next() bool {
 	if pi.lk != nil {
 		pi.lk.lock()
 		defer pi.lk.unlock()
-		if pi.lk.Done() {
+		if pi.tripped {
 			pi.err = ErrTxIsUsed
 			return false
 		}
@@ -147,7 +156,7 @@ func (pi *planIterator) Doc() (Doc, error) {
 		if pi.lk != nil {
 			pi.lk.lock()
 			defer pi.lk.unlock()
-			if pi.lk.Done() {
+			if pi.tripped {
 				return nil, ErrTxIsUsed
 			}
 		}
@@ -211,17 +220,11 @@ func (pi *planIterator) Close() (err error) {
 	if pi.lk != nil {
 		pi.lk.lock()
 		defer pi.lk.unlock()
-	}
-	// The cursors' pages are the transaction's: ended by another call, it
-	// took them, and the cursors are left alone.
-	if pi.lk == nil || !pi.lk.Done() {
-		if pi.dataCursor != nil {
-			pi.dataCursor.Close()
-		}
-		if pi.plan != nil {
-			pi.plan.Close()
+		if !pi.tripped {
+			pi.lk.iterClosed(pi)
 		}
 	}
+	pi.releaseCursors()
 	if pi.tx != nil {
 		err = errors.Join(err, pi.tx.Commit())
 	}
@@ -236,6 +239,27 @@ func (pi *planIterator) Close() (err error) {
 
 func (pi *planIterator) String() string {
 	return pi.plan.String()
+}
+
+// trip is the transaction ending under its lock (commonTx.tripIters): the
+// cursors' pages go with it.
+func (pi *planIterator) trip() {
+	pi.releaseCursors()
+	pi.tripped = true
+}
+
+// releaseCursors closes the cursors once: Plan.Close is not idempotent.
+func (pi *planIterator) releaseCursors() {
+	if pi.tripped {
+		return
+	}
+	if pi.dataCursor != nil {
+		pi.dataCursor.Close()
+		pi.dataCursor = nil
+	}
+	if pi.plan != nil {
+		pi.plan.Close()
+	}
 }
 
 // emptyIter is the public Iterator returned by Find().Iter() when the

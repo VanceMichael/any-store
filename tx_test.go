@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,7 +14,30 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
+
+// blockingFilter holds the turn of the call evaluating it: Ok blocks until
+// release is closed. entered is closed as Ok first runs.
+type blockingFilter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingFilter() *blockingFilter {
+	return &blockingFilter{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (f *blockingFilter) Ok(*anyenc.Value, *syncpool.DocBuffer) bool {
+	f.once.Do(func() { close(f.entered) })
+	<-f.release
+	return true
+}
+
+func (f *blockingFilter) IndexBounds(_ string, bs query.Bounds) query.Bounds { return bs }
+
+func (f *blockingFilter) String() string { return "blocking" }
 
 func TestDb_WriteTx(t *testing.T) {
 	t.Run("err other instance", func(t *testing.T) {
@@ -482,33 +506,255 @@ func TestWriteTx_CallAfterAnotherGoroutineEnds(t *testing.T) {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
-		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1}`)))
+		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2}`)))
 
-		// Runs inside Commit, under the lock: the Count started here waits
-		// for the commit to end, then finds the transaction gone — whatever
-		// the transaction's pooled state serves by then.
+		// A call holds the turn inside a filter. The commit queues for it
+		// first and the count after: the count passes every check made
+		// before the lock while the transaction is live, and finds it
+		// ended under the lock (the mutex hands over in order once the
+		// waits pass a millisecond).
+		f := newBlockingFilter()
+		held := make(chan error, 1)
+		go func() {
+			_, err := coll.Find(f).Count(tx.Context())
+			held <- err
+		}()
+		<-f.entered
+		committed := make(chan error, 1)
+		go func() { committed <- tx.Commit() }()
+		time.Sleep(20 * time.Millisecond)
 		counted := make(chan error, 1)
-		testHookAfterBtreeCommit = func() {
-			testHookAfterBtreeCommit = nil
-			go func() {
-				_, err := coll.Count(tx.Context())
-				counted <- err
-			}()
-			time.Sleep(50 * time.Millisecond)
-		}
-		defer func() { testHookAfterBtreeCommit = nil }()
-		require.NoError(t, tx.Commit())
+		go func() {
+			_, err := coll.Count(tx.Context())
+			counted <- err
+		}()
+		time.Sleep(20 * time.Millisecond)
+		close(f.release)
+		require.NoError(t, <-held)
+		require.NoError(t, <-committed)
 		assert.ErrorIs(t, <-counted, ErrTxIsUsed)
-
-		// The pooled state serves a new transaction.
-		tx2, err := fx.WriteTx(ctx)
-		require.NoError(t, err)
-		require.NoError(t, coll.Insert(tx2.Context(), anyenc.MustParseJson(`{"id":2}`)))
-		require.NoError(t, tx2.Commit())
 		assertCollCount(t, coll, 2)
 	})
+}
+
+// A handle of a transaction that ended fails with ErrTxIsUsed and touches
+// nothing of the transaction that reuses the pooled state: its lock and its
+// context are the handle's own.
+func TestWriteTx_HandleOfEndedTx(t *testing.T) {
+	t.Run("context", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+		// The next transaction takes the pooled state.
+		tx2, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx2.Rollback() }()
+		assert.ErrorIs(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1}`)), ErrTxIsUsed)
+		_, err = coll.Count(tx.Context())
+		assert.ErrorIs(t, err, ErrTxIsUsed)
+		assert.NoError(t, tx.Rollback())
+		assertCollCountInTx(tx2.Context(), t, coll, 0)
+	})
+
+	t.Run("call does not wait for the reusing transaction", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+		tx1, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, tx1.Commit())
+		tx2, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		f := newBlockingFilter()
+		held := make(chan error, 1)
+		go func() {
+			_, err := coll.Find(f).Count(tx2.Context())
+			held <- err
+		}()
+		<-f.entered
+		// tx2's turn is held: a call on tx1 waits for nothing.
+		counted := make(chan error, 1)
+		go func() {
+			_, err := coll.Count(tx1.Context())
+			counted <- err
+		}()
+		select {
+		case err := <-counted:
+			assert.ErrorIs(t, err, ErrTxIsUsed)
+		case <-time.After(2 * time.Second):
+			t.Fatal("a call on the ended transaction waited for the transaction reusing its state")
+		}
+		close(f.release)
+		require.NoError(t, <-held)
+		require.NoError(t, tx2.Commit())
+	})
+
+	t.Run("savepoint context after its state is reused", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(sp.Context(), anyenc.MustParseJson(`{"id":1}`)))
+		require.NoError(t, sp.Commit())
+		// Every write in the transaction opens a savepoint of its own, on
+		// the pooled state sp used. sp's context stays the transaction's:
+		// a call through it takes its turn like any other.
+		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":2}`)))
+		var wg sync.WaitGroup
+		errs := make(chan error, 4)
+		for g := 0; g < 4; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				for j := 0; j < 200; j++ {
+					var err error
+					if g%2 == 0 {
+						_, err = coll.FindId(sp.Context(), 1)
+					} else {
+						err = coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, 100+g*1000+j)))
+					}
+					if err != nil {
+						errs <- err
+						return
+					}
+				}
+				errs <- nil
+			}(g)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
+		require.NoError(t, tx.Commit())
+		assertCollCount(t, coll, 2+400)
+	})
+
+	t.Run("savepoint Done inside a modifier", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"v":0}`)))
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		sp, err := fx.WriteTx(tx.Context())
+		require.NoError(t, err)
+		var seen bool
+		updated := make(chan error, 1)
+		go func() {
+			_, err := coll.UpdateId(sp.Context(), 1, query.ModifyFunc(func(a *anyenc.Arena, v *anyenc.Value) (*anyenc.Value, bool, error) {
+				seen = sp.Done()
+				return v, false, nil
+			}))
+			updated <- err
+		}()
+		select {
+		case err := <-updated:
+			require.NoError(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("sp.Done inside a modifier waited for the modifier's own call")
+		}
+		assert.False(t, seen)
+		require.NoError(t, sp.Commit())
+		assert.True(t, sp.Done())
+		require.NoError(t, tx.Rollback())
+	})
+}
+
+// The end of a transaction trips the iterators open on it: their pages go
+// with it, and an iterator closed afterwards holds none.
+func TestWriteTx_EndTripsOpenIterators(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%7))))
+	}
+	for i := 0; i < 50; i++ {
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		// Partly drained: a leaf stays pinned under the cursor, and the
+		// Doc fallback cursor sits on another.
+		iter, err := coll.Find(`{"a":3}`).Sort("-id").Iter(tx.Context())
+		require.NoError(t, err)
+		require.True(t, iter.Next())
+		_, err = iter.Doc()
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+		assert.False(t, iter.Next())
+		assert.ErrorIs(t, iter.Err(), ErrTxIsUsed)
+		require.NoError(t, iter.Close())
+	}
+	_, pinned := fx.DB.(*db).btreeDB.WriterCachePins()
+	assert.Zero(t, pinned, "pages pinned after the iterators' transactions ended")
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	iter, err := coll.Find(nil).Iter(rtx.Context())
+	require.NoError(t, err)
+	require.True(t, iter.Next())
+	require.NoError(t, rtx.Commit())
+	assert.False(t, iter.Next())
+	assert.ErrorIs(t, iter.Err(), ErrTxIsUsed)
+	require.NoError(t, iter.Close())
+}
+
+// Two goroutines that ensure the same collection in one transaction get
+// one handle: the open — the log, the registry, the catalog — and the
+// create run in one turn.
+func TestWriteTx_OpenAndCreateInOneTurn(t *testing.T) {
+	fx := newFixture(t)
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	// Between the first open's log lookup and its catalog read, a second
+	// goroutine ensures the same collection: it waits for the turn, and
+	// creates the collection — or finds it — once the first open is done.
+	// Were the open two turns, the create would land between them and the
+	// catalog read would register a second handle.
+	var fired atomic.Bool
+	created := make(chan error, 1)
+	bDone := make(chan struct{})
+	var hB Collection
+	testHookAfterLogLookup = func(name string) {
+		if !fired.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			defer close(bDone)
+			var err error
+			hB, err = fx.Collection(tx.Context(), name)
+			created <- err
+		}()
+		// Done at once were the open two turns; waiting for the turn the
+		// open holds otherwise.
+		select {
+		case <-bDone:
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	defer func() { testHookAfterLogLookup = nil }()
+	hA, err := fx.Collection(tx.Context(), "c")
+	require.NoError(t, err)
+	require.NoError(t, <-created)
+	// One handle: the index made through one is maintained by the other.
+	require.NoError(t, hA.EnsureIndex(tx.Context(), IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, hB.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1,"a":1}`)))
+	require.NoError(t, tx.Commit())
+	c, err := fx.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	assertQueryCount(t, c.Find(`{"a":1}`), 1)
+	require.Len(t, c.GetIndexes(), 1)
+	assertIndexLen(t, c.GetIndexes()[0], 1)
 }
 
 // The calls an operation makes on the transaction its context carries,

@@ -438,16 +438,23 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return &emptyIter{}, nil
 	}
 
-	tx, err := q.c.db.getReadTx(ctx)
+	// The iterator keeps tx beyond this call: the turn ends with the call,
+	// and the iterator's methods take theirs (lk).
+	tx, lk, err := q.c.db.lockCtxTx(ctx)
 	if err != nil {
 		qb.Close()
 		return
 	}
-	// The iterator keeps tx beyond this call: the turn ends with the call,
-	// and the iterator's methods take theirs.
-	tx, lk := detachLock(tx)
-	if lk != nil {
-		defer lk.unlock()
+	if tx == nil {
+		if tx, err = q.c.db.ReadTx(ctx); err != nil {
+			qb.Close()
+			return
+		}
+	} else {
+		if lk != nil {
+			defer lk.unlock()
+		}
+		tx = noOpTx{ReadTx: tx}
 	}
 
 	// Resolved inside the tx scope, for its snapshot (collection.resolve).
@@ -469,7 +476,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return nil, err
 	}
 
-	return &planIterator{
+	pi := &planIterator{
 		plan: plan,
 		tx:   tx,
 		lk:   lk,
@@ -477,7 +484,11 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		buf:  buf,
 		qb:   qb,
 		data: &qplanner.CursorSource{Tx: btx, Ns: s.ns},
-	}, nil
+	}
+	if lk != nil {
+		lk.iterOpened(pi)
+	}
+	return pi, nil
 }
 
 func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResult, err error) {

@@ -357,21 +357,30 @@ func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.P
 // else can reach it (planIterator.lk).
 func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, s *collSchema, held, lk ReadTx, err error) {
 	if pi, ok := inner.(*planIterator); ok {
-		return pi.tx.btreeReadTx(), pi.s, nil, pi.lk, nil
+		// The btree tx as Iter captured it under the turn: the iterator
+		// is outside its turn here.
+		return pi.data.Tx, pi.s, nil, pi.lk, nil
 	}
-	tx, err := q.c.db.getReadTx(ctx)
+	tx, lk, err := q.c.db.lockCtxTx(ctx)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	tx, lk = detachLock(tx)
-	if lk != nil {
-		defer lk.unlock()
+	if tx == nil {
+		if tx, err = q.c.db.ReadTx(ctx); err != nil {
+			return nil, nil, nil, nil, err
+		}
+	} else {
+		if lk != nil {
+			defer lk.unlock()
+		}
+		tx = noOpTx{ReadTx: tx}
 	}
-	if s, err = q.c.resolve(tx.btreeReadTx()); err != nil {
+	btx = tx.btreeReadTx()
+	if s, err = q.c.resolve(btx); err != nil {
 		_ = tx.Commit()
 		return nil, nil, nil, nil, err
 	}
-	return tx.btreeReadTx(), s, tx, lk, nil
+	return btx, s, tx, lk, nil
 }
 
 // lookupFunc serves $lookup point reads against btx, s being the version
