@@ -78,6 +78,12 @@ type DB interface {
 	// Returns a WriteTx or an error if there is an issue starting the transaction.
 	WriteTx(ctx context.Context) (WriteTx, error)
 
+	// WatchCollection opens a change stream on the named collection. The
+	// stream is bound to the collection's immutable identity: renames do
+	// not interrupt it, a drop ends it, and a same-named recreated
+	// collection is a different stream. See WatchOptions and ChangeStream.
+	WatchCollection(ctx context.Context, collectionName string, opts ...WatchOptions) (ChangeStream, error)
+
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
 	Close() error
@@ -129,6 +135,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		syncPool:          sPool,
 		openedCollections: make(map[string]Collection),
 		byIdentity:        make(map[string]*collection),
+		streamNotifier:    newChangeNotifier(),
 	}
 
 	var quickCheckNeeded bool
@@ -329,6 +336,11 @@ type db struct {
 	sketchDirty []*collection
 	ftsDirty    []*collection
 
+	// streamNotifier wakes change streams caught up in this process after
+	// a commit of this process. Peer-process commits are observed by
+	// polling the WAL-index (ChangeStreamPollInterval), never via this.
+	streamNotifier *changeNotifier
+
 	closed atomic.Bool
 
 	dirtyOnOpen             bool
@@ -488,6 +500,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.writeTx = btWtx
 	tx.modified = false
 	tx.savepoints = tx.savepoints[:0]
+	tx.schema.changes.reset()
 	btWtx.SetAux(&tx.schema)
 
 	db.checkStale(&btWtx.ReadTx)

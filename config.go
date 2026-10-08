@@ -160,6 +160,14 @@ type Config struct {
 	// this flag (disabling AEAD verification would return attacker-
 	// controlled plaintext, defeating the cipher).
 	ContinueOnIntegrityError bool
+
+	// ChangeStreamPollInterval is how long a caught-up change stream
+	// waits before re-reading the WAL-index to observe commits made by
+	// OTHER processes — the database's existing cross-process
+	// visibility channel. Commits of the same process wake streams
+	// immediately. Default 200ms; lower values shorten cross-process
+	// latency at the cost of more polling.
+	ChangeStreamPollInterval time.Duration
 }
 
 // EncryptionConfig enables page-level encryption of the database file.
@@ -266,6 +274,9 @@ type DurabilityConfig struct {
 func (c *Config) setDefaults() {
 	if c.SyncPoolElementMaxSize <= 0 {
 		c.SyncPoolElementMaxSize = 2 << 20
+	}
+	if c.ChangeStreamPollInterval <= 0 {
+		c.ChangeStreamPollInterval = 200 * time.Millisecond
 	}
 
 	if c.Durability.AutoFlush {

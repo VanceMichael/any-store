@@ -264,6 +264,13 @@ func (w writeTx) Commit() error {
 				_ = w.unwind()
 				return err
 			}
+			// Materialize change events in this SAME tx, after every index
+			// write has landed: events and documents/indexes commit and
+			// become visible atomically. Failure rolls the whole tx back.
+			if err := w.db.prepareChangeEvents(w.writeTx, &w.commonTx.schema.changes); err != nil {
+				_ = w.unwind()
+				return err
+			}
 		}
 		if w.writeTx.SchemaChanged() && w.writeTx.HasChanges() {
 			// See formatSettledKey. An empty commit (EnsureIndex of an
@@ -291,6 +298,9 @@ func (w writeTx) Commit() error {
 		}
 		if err == nil && w.modified {
 			w.db.recoveryController.OnWriteEvent()
+			// Wake streams caught up in THIS process; peer processes
+			// observe the commit via the WAL-index at their next poll.
+			w.db.streamNotifier.wake()
 		}
 		// A log the commit did not publish is discarded, as after a rollback.
 		if !t.installed {
@@ -350,13 +360,18 @@ type savepointTx struct {
 	// inside its scope (entries [logMark:]); a release keeps them on the
 	// parent so an outer rollback still discards them.
 	logMark int
-	version atomic.Uint32
+	// changeMark is the parent tx's change buffer length at savepoint
+	// creation: a rollback discards exactly the buffered document changes
+	// made inside its scope, matching the btree page revert.
+	changeMark int
+	version    atomic.Uint32
 }
 
 func (tx *savepointTx) reset(wtx WriteTx, spId int) {
 	tx.WriteTx = wtx
 	tx.savepointId = spId
 	tx.logMark = len(wtx.schemaLog().log)
+	tx.changeMark = wtx.schemaLog().changes.mark()
 	tx.version.Store(newTxVersion())
 }
 
@@ -408,6 +423,9 @@ func (w savepointWrapper) Rollback() error {
 		// discard runs inside the critical section.
 		db.resetAllFtsPending(&btWtx.ReadTx)
 		db.discardLog(w.WriteTx.schemaLog(), w.logMark)
+		// Discard document changes buffered inside this scope: their
+		// btree pages were just reverted, so no event may outlive them.
+		w.WriteTx.schemaLog().changes.rollbackTo(w.changeMark)
 		if err != nil {
 			return err
 		}

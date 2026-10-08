@@ -122,6 +122,18 @@ type Collection interface {
 	// was.
 	Drop(ctx context.Context) (err error)
 
+	// Watch opens a change stream on the collection, bound to its
+	// immutable identity rather than its current name. Events are
+	// delivered in committed order with savable resume tokens; a rename
+	// keeps the stream alive, a drop ends it (ErrChangeStreamEnded).
+	Watch(ctx context.Context, opts ...WatchOptions) (ChangeStream, error)
+
+	// PurgeChangeEvents deletes the retained change events at and before
+	// the token position and advances the retention anchor. Events after
+	// the token are never deleted; the caller ensures every durable
+	// subscriber has confirmed the token.
+	PurgeChangeEvents(ctx context.Context, token ResumeToken) error
+
 	// ReadTx starts a new read-only transaction. It's just a proxy to db object.
 	// Returns a ReadTx or an error if there is an issue starting the transaction.
 	ReadTx(ctx context.Context) (ReadTx, error)
@@ -532,6 +544,14 @@ func (c *collection) insertItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.
 			return err
 		}
 	}
+	// Record the change (copies independent of pooled buffers); the
+	// sequence is assigned at commit, same tx as this document.
+	txSchemaOf(&tx.ReadTx).changes.add(pendingChange{
+		op:   OperationInsert,
+		coll: c,
+		id:   append([]byte(nil), buf.SmallBuf...),
+		doc:  append([]byte(nil), buf.DocBuf...),
+	})
 	return nil
 }
 
@@ -740,6 +760,14 @@ func (c *collection) update(tx *btree.WriteTx, s *collSchema, it, prevIt item) (
 	if err = tx.Put(s.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return
 	}
+	// Only an actual change reaches here: record the update event with
+	// the exact bytes committed to the data namespace.
+	txSchemaOf(&tx.ReadTx).changes.add(pendingChange{
+		op:   OperationUpdate,
+		coll: c,
+		id:   append([]byte(nil), buf.SmallBuf...),
+		doc:  append([]byte(nil), buf.DocBuf...),
+	})
 
 	return true, nil
 }
@@ -846,7 +874,17 @@ func (c *collection) deleteItem(tx *btree.WriteTx, s *collSchema, buf *syncpool.
 			}
 		}
 	}
-	return tx.Delete(s.ns, id)
+	if err = tx.Delete(s.ns, id); err != nil {
+		return err
+	}
+	// Record the delete only once the data delete succeeded; the id
+	// bytes are copied (the caller's buffer is reused).
+	txSchemaOf(&tx.ReadTx).changes.add(pendingChange{
+		op:   OperationDelete,
+		coll: c,
+		id:   append([]byte(nil), id...),
+	})
+	return nil
 }
 
 func (c *collection) Count(ctx context.Context) (count int, err error) {
@@ -1430,6 +1468,13 @@ func (c *collection) Drop(ctx context.Context) error {
 			if !errors.Is(err, btree.ErrNamespaceNotFound) {
 				return
 			}
+		}
+		// Delete the change stream namespace, derived from the immutable
+		// identity: the old stream ends here, and a same-named recreated
+		// collection gets its own namespace — it cannot resume this one.
+		if err = tx.DeleteNamespace(changeStreamNsName(c)); err != nil &&
+			!errors.Is(err, btree.ErrNamespaceNotFound) {
+			return
 		}
 		c.logDrop(wtx, s)
 		return nil

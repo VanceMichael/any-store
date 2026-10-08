@@ -253,6 +253,11 @@ type txSchema struct {
 	// installed reports that the commit published the log (install ran):
 	// the registry has to follow it (settleLog), whatever Commit returned.
 	installed bool
+
+	// changes collects the committed-form document changes of a write tx
+	// in execution order (writer-owned); sequences are assigned at commit
+	// and discarded on every rollback. See changeBuffer.
+	changes changeBuffer
 }
 
 type memoEntry struct {
@@ -320,6 +325,7 @@ func (t *txSchema) release() {
 	clear(t.log)
 	t.log = t.log[:0]
 	t.installed = false
+	t.changes.reset()
 }
 
 // logged returns the last schema change the open write transaction tx made
