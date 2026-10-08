@@ -873,7 +873,16 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 	if len(info) == 0 {
 		return nil
 	}
-	return c.db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
+	// Validate every definition up front, before any DDL or routing: a
+	// TTL clause on a full-text/vector index is rejected here rather
+	// than silently dropped by the kind-specific branch.
+	var ttlAdded bool
+	for _, idxInfo := range info {
+		if err = validateTTLIndex(idxInfo); err != nil {
+			return err
+		}
+	}
+	err = c.db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
 		s, txErr := c.beginDDL(wtx)
 		if txErr != nil {
 			return false, txErr
@@ -920,6 +929,9 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 				}
 				return false, txErr
 			}
+			if idxInfo.TTL != nil {
+				ttlAdded = true
+			}
 			newIndexes = append(newIndexes, idx)
 		}
 
@@ -941,6 +953,16 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		c.logVersion(wtx, s, next)
 		return true, nil
 	})
+	if err != nil {
+		return err
+	}
+	// A newly created TTL index needs the monitor: no goroutine runs on a
+	// database that had no TTL index before. Idempotent when one is
+	// already running (or the new index only matched an existing one).
+	if ttlAdded && c.db.ttl != nil {
+		c.db.ttl.ensureStarted()
+	}
+	return nil
 }
 
 func (c *collection) createIndex(tx *btree.WriteTx, s *collSchema, info IndexInfo) (idx *index, err error) {
@@ -949,6 +971,9 @@ func (c *collection) createIndex(tx *btree.WriteTx, s *collSchema, info IndexInf
 		info.Name = info.createName()
 	}
 	if err = validateIndexName(info.Name); err != nil {
+		return nil, err
+	}
+	if err = validateTTLIndex(info); err != nil {
 		return nil, err
 	}
 	for _, field := range info.Fields {
@@ -1633,9 +1658,12 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, collName string, idx *index,
 
 // indexInfoEqual reports whether two IndexInfo values describe the same index
 // definition: same name, same fields (order significant), same unique and
-// sparse flags.
+// sparse flags, and the same TTL definition.
 func indexInfoEqual(a, b IndexInfo) bool {
 	if a.Name != b.Name || a.Unique != b.Unique || a.Sparse != b.Sparse {
+		return false
+	}
+	if !ttlParamsEqual(a.TTL, b.TTL) {
 		return false
 	}
 	if len(a.Fields) != len(b.Fields) {
@@ -1647,6 +1675,14 @@ func indexInfoEqual(a, b IndexInfo) bool {
 		}
 	}
 	return true
+}
+
+// ttlParamsEqual compares two TTL definitions nil-safely.
+func ttlParamsEqual(a, b *TTLParams) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.ExpireAfterMillis() == b.ExpireAfterMillis()
 }
 
 // persistSketches writes all modified live sketches to the _system namespace and

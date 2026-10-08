@@ -87,6 +87,11 @@ var (
 	// first, then create it with the new definition.
 	ErrIndexMismatch = errors.New("any-store: index exists with a different definition")
 
+	// ErrTTLIndexInvalid is returned when a TTL index definition is invalid:
+	// it must be a range index over exactly one ascending field with a
+	// non-negative expiration duration (see TTLParams).
+	ErrTTLIndexInvalid = errors.New("any-store: invalid TTL index definition")
+
 	// ErrTxIsReadOnly is returned when a write operation is attempted in a read-only transaction.
 	ErrTxIsReadOnly = errors.New("any-store: transaction is read-only")
 

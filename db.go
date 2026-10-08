@@ -252,6 +252,20 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		return nil, err
 	}
 
+	// Start the TTL monitor only for a database whose schema already
+	// carries a TTL index: the opening sweep removes deadlines missed
+	// while closed, and the background loop follows. A database without
+	// one starts nothing (see ttl.go).
+	ds.ttl = newTTLMonitor(ds, config.TTL)
+	if err = ds.ttl.startup(ctx); err != nil {
+		_ = ds.ttl.stop()
+		if ds.recoveryController != nil {
+			_ = ds.recoveryController.Stop()
+		}
+		_ = ds.btreeDB.Close()
+		return nil, err
+	}
+
 	return ds, nil
 }
 
@@ -263,6 +277,11 @@ type db struct {
 	btreeDB            *btree.DB
 	systemNS           *btree.Namespace
 	recoveryController *durability.Controller
+
+	// ttl is the database's TTL monitor. Constructed at Open for every
+	// database; its background loop runs only while a TTL index exists
+	// (see ttl.go). nil only in unit tests that build a db by hand.
+	ttl *ttlMonitor
 
 	syncPool *syncpool.SyncPool
 
@@ -1277,6 +1296,13 @@ func (db *db) Close() error {
 		}
 	}
 
+	// Stop the TTL monitor before the btree closes: cancel its loop and
+	// wait for an in-flight sweep transaction (whose BeginWrite now fails
+	// with ErrClosed once the write lock frees) to release the lock.
+	if db.ttl != nil {
+		_ = db.ttl.stop()
+	}
+
 	if err := db.recoveryController.Stop(); err != nil {
 		log.Printf("recovery controller stop error: %v", err)
 	}
@@ -1527,6 +1553,9 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 		for _, fv := range v.GetArray("fields") {
 			info.Fields = append(info.Fields, string(fv.GetStringBytes()))
 		}
+		if tv := v.Get("ttl"); tv != nil {
+			info.TTL = &TTLParams{ExpireAfter: time.Duration(tv.GetInt("ea")) * time.Millisecond}
+		}
 		if IndexKind(v.GetInt("kind")) == IndexKindVector {
 			if vv := v.Get("vector"); vv != nil {
 				info.Kind = IndexKindVector
@@ -1603,7 +1632,22 @@ func indexDefMatches(persisted []byte, info IndexInfo) bool {
 	if info.Kind == IndexKindFulltext && !fulltextDefMatches(v.Get("fulltext"), info.Fulltext) {
 		return false
 	}
+	if !ttlDefMatches(v.Get("ttl"), info.TTL) {
+		return false
+	}
 	return true
+}
+
+// ttlDefMatches compares a persisted TTL record against the given params
+// (nil-safe; absent record matches a nil TTL).
+func ttlDefMatches(tv *anyenc.Value, p *TTLParams) bool {
+	if p == nil {
+		return tv == nil
+	}
+	if tv == nil {
+		return false
+	}
+	return tv.GetInt("ea") == int(p.ExpireAfterMillis())
 }
 
 // vectorDefMatches compares a persisted vector-param record against the given
@@ -1770,6 +1814,14 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 			}
 			obj.Set("fulltext", fobj)
 		}
+	}
+	if info.TTL != nil {
+		// TTL definition lives in the collection schema (the catalog
+		// record), so reopen and every peer process see the same
+		// expiration rule. Stored in milliseconds, matching DateTime.
+		tobj := a.NewObject()
+		tobj.Set("ea", a.NewNumberInt(int(info.TTL.ExpireAfterMillis())))
+		obj.Set("ttl", tobj)
 	}
 	return tx.Put(db.systemNS, key, obj.MarshalTo(nil))
 }

@@ -130,6 +130,15 @@ type Config struct {
 	// of the on-disk database file. Zero value means no encryption.
 	Encryption EncryptionConfig
 
+	// TTL configures the background TTL (time-to-live) monitor that deletes
+	// documents past the expiration of a TTL index. A database without any
+	// TTL index starts no monitor goroutine at all; the monitor starts when
+	// a database that carries a TTL index is opened (an opening sweep also
+	// removes documents that expired while it was closed), and when this
+	// process creates its first TTL index. It stops when the DB closes, and
+	// exits when no TTL index remains.
+	TTL TTLConfig
+
 	// OnIntegrityError, when non-nil, is invoked from the read path on
 	// every per-page integrity failure (XXH3 trailer mismatch in cksum
 	// mode, AEAD auth-tag failure in encryption mode). Plain databases
@@ -246,6 +255,19 @@ const (
 	FlushModeCheckpointTruncate FlushMode = "CHECKPOINT_TRUNCATE"
 )
 
+// TTLConfig configures the background TTL monitor. The zero value uses the
+// default sweep interval.
+type TTLConfig struct {
+	// SweepInterval bounds how often the TTL monitor looks for expired
+	// documents (default 60s). Between runs it also wakes at the next
+	// known expiration, so documents are removed shortly after their
+	// boundary even when the interval is long. Small intervals raise the
+	// rate of catalog scans on databases that carry a TTL index; set it
+	// low only in tests or latency-sensitive deployments. The monitor
+	// never runs for databases without a TTL index regardless.
+	SweepInterval time.Duration
+}
+
 type DurabilityConfig struct {
 	// Enable auto-flush according to IdleAfter and FlushMode
 	AutoFlush bool
@@ -275,6 +297,9 @@ func (c *Config) setDefaults() {
 		if c.Durability.FlushMode == "" {
 			c.Durability.FlushMode = FlushModeCheckpointPassive
 		}
+	}
+	if c.TTL.SweepInterval <= 0 {
+		c.TTL.SweepInterval = defaultTTLSweepInterval
 	}
 }
 

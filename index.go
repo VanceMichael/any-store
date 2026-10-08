@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -259,6 +260,60 @@ type IndexInfo struct {
 
 	// Vector configures a vector index when Kind == IndexKindVector.
 	Vector *VectorParams `json:"vector,omitempty"`
+
+	// TTL turns the index into a TTL (time-to-live) index: documents whose
+	// indexed field is a DateTime are deleted once the field value is older
+	// than TTL.ExpireAfter. Allowed only on a range index over exactly ONE
+	// ASCENDING field (Fields == []string{"field"}, no leading '-'), with a
+	// non-negative ExpireAfter — see TTLParams and validateTTLIndex.
+	TTL *TTLParams `json:"ttl,omitempty"`
+}
+
+// TTLParams configures a TTL index. A document expires when
+//
+//	indexedFieldMillis + ExpireAfter.Milliseconds() <= nowMillis
+//
+// so a document is never deleted before its boundary millisecond. Like the
+// stored DateTime, the duration has millisecond resolution. Documents in
+// which the field is missing, null or any non-DateTime type never expire
+// through this index; the same rule applies at index creation, reopen and
+// rebuild (only DateTime keys are ever candidates). The TTL monitor deletes
+// expired documents through the ordinary write transaction / document
+// deletion path, so range, full-text and vector derived indexes, the data
+// tree, counts, stats and cross-process snapshots converge in one commit.
+type TTLParams struct {
+	// ExpireAfter is added to the indexed DateTime to obtain the deletion
+	// boundary. Zero is valid (documents expire at the first sweep at or
+	// after their field timestamp); negative values are rejected.
+	ExpireAfter time.Duration `json:"expireAfter"`
+}
+
+// ExpireAfterMillis is the persisted millisecond form of ExpireAfter.
+func (p *TTLParams) ExpireAfterMillis() int64 {
+	return p.ExpireAfter.Milliseconds()
+}
+
+// validateTTLIndex enforces the TTL definition contract: a range index over
+// exactly one ascending field with a non-negative expiration. The indexed
+// VALUE is not checked here — non-DateTime values simply never expire, by the
+// same rule at create, reopen and rebuild.
+func validateTTLIndex(info IndexInfo) error {
+	if info.TTL == nil {
+		return nil
+	}
+	if info.Kind != IndexKindRange {
+		return fmt.Errorf("%w: TTL is supported only on a range index, not on kind %d", ErrTTLIndexInvalid, info.Kind)
+	}
+	if len(info.Fields) != 1 {
+		return fmt.Errorf("%w: a TTL index must be on exactly one field, got %d", ErrTTLIndexInvalid, len(info.Fields))
+	}
+	if strings.HasPrefix(info.Fields[0], "-") {
+		return fmt.Errorf("%w: a TTL index field must be ascending, got %q", ErrTTLIndexInvalid, info.Fields[0])
+	}
+	if info.TTL.ExpireAfter < 0 {
+		return fmt.Errorf("%w: expire-after duration must not be negative, got %s", ErrTTLIndexInvalid, info.TTL.ExpireAfter)
+	}
+	return nil
 }
 
 // FulltextParams configures a full-text index. All fields are optional; the
