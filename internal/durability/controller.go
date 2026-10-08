@@ -37,6 +37,14 @@ type Controller struct {
 	autoFlushCancel context.CancelFunc
 	autoFlushWG     sync.WaitGroup
 	lastWriteTime   atomic.Int64
+
+	// flushMu serializes (re)starting/stopping the auto-flush goroutine.
+	// flushActive reports whether the goroutine is currently live, which
+	// differs from running while a generation restore Pauses background
+	// flushes without tearing down the controller (and without touching the
+	// sentinel).
+	flushMu     sync.Mutex
+	flushActive bool
 }
 
 func NewController(opts Options) *Controller {
@@ -87,14 +95,72 @@ func (c *Controller) Start() error {
 		return fmt.Errorf("controller already running")
 	}
 
-	c.autoFlushCtx, c.autoFlushCancel = context.WithCancel(context.Background())
-
-	if c.opts.AutoFlushEnable {
-		c.autoFlushWG.Add(1)
-		go c.autoFlushLoop()
-	}
+	c.flushMu.Lock()
+	c.startAutoFlushLocked()
+	c.flushMu.Unlock()
 
 	return nil
+}
+
+// startAutoFlushLocked launches the idle-flush goroutine. Caller holds
+// flushMu. The timer is (re)armed from scratch so ticks that elapsed while
+// the loop was stopped (Pause, or before the first Start) do not fire one
+// immediate flush.
+func (c *Controller) startAutoFlushLocked() {
+	if !c.opts.AutoFlushEnable || c.flushActive {
+		return
+	}
+	if c.timer != nil {
+		if !c.timer.Stop() {
+			select {
+			case <-c.timer.C:
+			default:
+			}
+		}
+		c.timer.Reset(c.opts.AutoFlushIdleAfter)
+	}
+	c.autoFlushCtx, c.autoFlushCancel = context.WithCancel(context.Background())
+	c.autoFlushWG.Add(1)
+	c.flushActive = true
+	go c.autoFlushLoop()
+}
+
+// stopAutoFlushLocked cancels and joins the idle-flush goroutine. Caller
+// holds flushMu.
+func (c *Controller) stopAutoFlushLocked() {
+	if !c.flushActive {
+		return
+	}
+	c.autoFlushCancel()
+	c.timerMu.Lock()
+	c.timer.Stop()
+	c.timerMu.Unlock()
+	c.autoFlushWG.Wait()
+	c.flushActive = false
+}
+
+// Pause stops the background idle-flush goroutine while keeping the controller
+// running and leaving sentinel state untouched. Used by a generation restore:
+// no background checkpoint may run while files are detached. Resume restarts
+// the loop. Pause on a non-running controller is a no-op.
+func (c *Controller) Pause() {
+	if !c.running.Load() {
+		return
+	}
+	c.flushMu.Lock()
+	c.stopAutoFlushLocked()
+	c.flushMu.Unlock()
+}
+
+// Resume restarts a Paused background flush loop. No-op when not running or
+// when auto-flush is disabled.
+func (c *Controller) Resume() {
+	if !c.running.Load() {
+		return
+	}
+	c.flushMu.Lock()
+	c.startAutoFlushLocked()
+	c.flushMu.Unlock()
 }
 
 func (c *Controller) Stop() error {
@@ -102,13 +168,9 @@ func (c *Controller) Stop() error {
 		return nil
 	}
 
-	if c.opts.AutoFlushEnable {
-		c.autoFlushCancel()
-		c.timerMu.Lock()
-		c.timer.Stop()
-		c.timerMu.Unlock()
-		c.autoFlushWG.Wait()
-	}
+	c.flushMu.Lock()
+	c.stopAutoFlushLocked()
+	c.flushMu.Unlock()
 
 	if c.opts.Sentinel != nil {
 		c.opts.Sentinel.MarkClean()

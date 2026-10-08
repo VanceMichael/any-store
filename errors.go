@@ -118,4 +118,19 @@ var (
 	// ErrPageBufferNotInitialized is returned when UseGlobalPageBuffer is set
 	// but InitPageBuffer was not called before opening the database.
 	ErrPageBufferNotInitialized = errors.New("any-store: global page buffer not initialized (call InitPageBuffer first)")
+
+	// ErrRestoreInTransaction is returned when Restore is invoked from a
+	// context carrying an open transaction.
+	ErrRestoreInTransaction = errors.New("any-store: restore cannot run inside a transaction")
+)
+
+// Whole-database restore errors. They alias the btree-layer sentinels so
+// errors.Is matches the error returned by the engine.
+var (
+	ErrRestoreUnsupported = btree.ErrRestoreUnsupported
+	ErrRestoreFormat      = btree.ErrRestoreFormat
+	ErrRestorePageSize    = btree.ErrRestorePageSize
+	ErrRestoreEncryption  = btree.ErrRestoreEncryption
+	ErrRestoreBusy        = btree.ErrRestoreBusy
+	ErrRestoreInProgress  = btree.ErrRestoreInProgress
 )

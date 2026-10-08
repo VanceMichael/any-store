@@ -11,9 +11,11 @@ var (
 		return os.OpenFile(name, flag, perm)
 	}
 	defaultRemove = os.Remove
+	defaultRename = os.Rename
 
 	osOpenFile = defaultOpenFile
 	osRemove   = defaultRemove
+	osRename   = defaultRename
 	fdatasync  = defaultFdatasync
 )
 

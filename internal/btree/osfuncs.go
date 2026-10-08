@@ -13,6 +13,11 @@ func osOpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 
 var osRemove = os.Remove
 
+// osRename renames (moves) a file. Used by the generation-swap restore
+// protocol (restore.go). Kept as a package variable to match osRemove and
+// because VFS builds rebind the other os* primitives.
+var osRename = os.Rename
+
 // SetVFS replaces OS-level operations. Panics unless built with -tags vfs
 // or GOOS=js GOARCH=wasm.
 func SetVFS(_ VFS) {

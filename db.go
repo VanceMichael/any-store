@@ -70,6 +70,21 @@ type DB interface {
 	// Returns an error if the operation fails.
 	Backup(ctx context.Context, path string) (err error)
 
+	// Restore replaces the whole live database with the validated backup at
+	// backupPath (a single-file backup produced by Backup). The backup's
+	// format, structural integrity, encryption and page size are verified
+	// BEFORE any current file changes; the generation swap is coordinated
+	// with transactions, readers, checkpoints, the background durability
+	// controller and other processes' file locks, so observers see either
+	// the pre-restore or the post-restore complete state. On success the DB
+	// handle keeps working; previously opened Collection handles are
+	// invalidated (operations return ErrCollectionClosed) and must be
+	// reopened against the restored schema. A failure in any phase, including
+	// context cancellation, rolls back to the still-open previous
+	// generation; a crash at the swap boundary is resolved deterministically
+	// by the next Open. Restore cannot be called from within a transaction.
+	Restore(ctx context.Context, backupPath string) error
+
 	// ReadTx starts a new read-only transaction.
 	// Returns a ReadTx or an error if there is an issue starting the transaction.
 	ReadTx(ctx context.Context) (ReadTx, error)

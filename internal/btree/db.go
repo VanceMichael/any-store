@@ -323,6 +323,13 @@ type DB struct {
 	closed          atomic.Bool // set when Close() is actually called
 	writerLocksDone atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
 
+	// restoreMu serializes Restore calls on this handle. swapping is set for
+	// the short generation-swap window (checkpoint folded, files detached) so
+	// new transactions fail fast with ErrRestoreInProgress instead of
+	// blocking on the quiesce locks.
+	restoreMu sync.Mutex
+	swapping  atomic.Bool
+
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
 	masterBT *btree
@@ -496,6 +503,16 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, ErrPageSlabNotInitialized
 	}
 
+	// Finish an interrupted restore generation swap BEFORE reading the header
+	// or building the codec: the adopted generation alone determines the
+	// page size, salt and integrity mode. No-op (one directory stat) on the
+	// default path when no restore ever ran.
+	if !opts.InMemory {
+		if err := settleRestoreGenerations(path); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := initPageBufferPool(opts.PageSize); err != nil {
 		return nil, err
 	}
@@ -667,15 +684,7 @@ func Open(path string, opts Options) (*DB, error) {
 	// pager.commit finds its counters remembered: the pager has them in its
 	// header before the frames are written. The dataVersion is the one such
 	// a reader loads.
-	p.wal.onPublish = func(hdr WalIndexHdr) {
-		db.snapCounters.put(db.dataVersion.Load(), &hdr, p.header.FileChangeCount, p.header.SchemaCookie)
-		if hdr.synthesized() {
-			db.published, db.hasPublished = hdr, true
-		}
-		if f := db.commitHook; f != nil {
-			f(p.header.FileChangeCount, p.header.SchemaCookie)
-		}
-	}
+	db.installOnPublishHook()
 
 	// Initialize local counters from the on-disk state (reading through WAL).
 	maxFrame, slot, err := p.beginRead()
@@ -816,6 +825,9 @@ func (db *DB) Options() Options {
 func (db *DB) beginRead(readCounters, wait bool) (*ReadTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
+	}
+	if db.swapping.Load() {
+		return nil, ErrRestoreInProgress
 	}
 
 	// Acquire reader semaphore — limits concurrent read transactions.
@@ -1019,16 +1031,28 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
 	}
+	if db.swapping.Load() {
+		return nil, ErrRestoreInProgress
+	}
 	db.writeMu.Lock()
 	if db.closing.Load() {
 		db.writeMu.Unlock()
 		return nil, ErrClosed
+	}
+	if db.swapping.Load() {
+		db.writeMu.Unlock()
+		return nil, ErrRestoreInProgress
 	}
 	db.mu.RLock()
 	if db.closing.Load() {
 		db.mu.RUnlock()
 		db.writeMu.Unlock()
 		return nil, ErrClosed
+	}
+	if db.swapping.Load() {
+		db.mu.RUnlock()
+		db.writeMu.Unlock()
+		return nil, ErrRestoreInProgress
 	}
 
 	var maxFrame uint32
@@ -1657,9 +1681,9 @@ type ReadTx struct {
 	snapFileChangeCounter uint32
 	snapSchemaCookie      uint32
 	// aux is the caller's per-transaction state (see Aux).
-	aux                    any
-	closed                 bool
-	writable               bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
+	aux      any
+	closed   bool
+	writable bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
 }
 
 // WalMaxFrame returns the reader's snapshot mxFrame. Prefer this over
